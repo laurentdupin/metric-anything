@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(metricanything_native VERSION 0.1.0 LANGUAGES C CXX)
+project(metricanything_native VERSION 0.1.1 LANGUAGES C CXX)
 
 set(MOGE2_NATIVE_SOURCE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../../moge-2/native"

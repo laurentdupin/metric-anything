@@ -19,4 +19,5 @@ MoGe-2 `native` directory. The deterministic converter is
 
 The public family is `MetricAnything`; `Student PointMap` is a weight row, not
 a separate public model identity. Output is source-sized metric Z depth in
-metres, with invalid masked pixels represented by positive infinity.
+metres. The harness replaces invalid masked pixels before publication with the
+finite `BackgroundDistanceMetres` model parameter (50 metres by default).
