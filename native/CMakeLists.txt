@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(metricanything_native VERSION 0.1.1 LANGUAGES C CXX)
 
 set(MOGE2_NATIVE_SOURCE_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../moge-2/native"
+    "${CMAKE_CURRENT_SOURCE_DIR}/moge2_runtime"
     CACHE PATH "Path to the shared MoGe-2 native operator implementation")
 if(NOT EXISTS "${MOGE2_NATIVE_SOURCE_DIR}/CMakeLists.txt")
   message(FATAL_ERROR

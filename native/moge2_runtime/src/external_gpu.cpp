@@ -1,0 +1,320 @@
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <inferbridge/linux_capture_preprocess.h>
+#endif
+#include "external_gpu.h"
+#include "moge2_native.h"
+
+#include "gpu_model.h"
+#include "gpu_preprocess.h"
+#include "graph_gpu.h"
+#include "operators.h"
+#include "safetensors.h"
+#include "vulkan.h"
+#include "inferbridge/native_harness_resource_lifetime.h"
+#include "inferbridge/native_harness_resource_cache.h"
+#include "inferbridge/native_harness_host_image.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <mutex>
+#include <stdexcept>
+#include <utility>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#endif
+
+namespace moge2_native {
+namespace {
+#if defined(_WIN32)
+using Microsoft::WRL::ComPtr;
+constexpr std::uint32_t kMaximumJobs = 3u;
+
+void check(HRESULT result, const char* operation) {
+    if (FAILED(result)) throw std::runtime_error(
+        std::string(operation) + " failed with HRESULT " +
+        std::to_string(static_cast<long>(result)));
+}
+
+ComPtr<ID3D12Device> matching_device(std::uint64_t luid) {
+    ComPtr<IDXGIFactory6> factory;
+    check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
+    for (UINT index = 0;; ++index) {
+        ComPtr<IDXGIAdapter1> adapter;
+        const HRESULT status = factory->EnumAdapters1(index, &adapter);
+        if (status == DXGI_ERROR_NOT_FOUND) break;
+        check(status, "EnumAdapters1");
+        DXGI_ADAPTER_DESC1 descriptor{};
+        check(adapter->GetDesc1(&descriptor), "GetDesc1");
+        std::uint64_t candidate = 0u;
+        std::memcpy(&candidate, &descriptor.AdapterLuid, sizeof(candidate));
+        if (candidate != luid) continue;
+        ComPtr<ID3D12Device> device;
+        check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+            IID_PPV_ARGS(&device)), "D3D12CreateDevice");
+        return device;
+    }
+    return {};
+}
+
+void validate_texture(ID3D12Device* device, std::uintptr_t handle,
+    std::uint32_t width, std::uint32_t height, DXGI_FORMAT format) {
+    ComPtr<ID3D12Resource> resource;
+    check(device->OpenSharedHandle(reinterpret_cast<HANDLE>(handle),
+        IID_PPV_ARGS(&resource)), "OpenSharedHandle(MoGe-2)");
+    const D3D12_RESOURCE_DESC descriptor = resource->GetDesc();
+    if (descriptor.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        descriptor.Width != width || descriptor.Height != height ||
+        descriptor.DepthOrArraySize != 1u || descriptor.MipLevels != 1u ||
+        descriptor.SampleDesc.Count != 1u || descriptor.Format != format)
+        throw std::invalid_argument("MoGe-2 shared texture descriptor mismatch");
+}
+
+class Job final : public ExternalJob {
+public:
+    Job(std::shared_ptr<ExternalGpu> owner,
+        da3_native::VulkanSubmission submission,
+        inferbridge::native_harness::ResourceLifetimeDomainPtr lifetime)
+        : owner_(std::move(owner)), submission_(std::move(submission)),
+          lifetime_(std::move(lifetime)) {}
+    ~Job() override {
+        inferbridge::native_harness::wait_then_retire(
+            lifetime_, submission_, [] {});
+    }
+    ExternalJobState state() const override {
+        if (cancelled_.load(std::memory_order_relaxed))
+            return ExternalJobState::cancelled;
+        return submission_.ready() ? ExternalJobState::complete :
+            ExternalJobState::running;
+    }
+    void cancel() override { cancelled_.store(true, std::memory_order_relaxed); }
+private:
+    std::shared_ptr<ExternalGpu> owner_;
+    da3_native::VulkanSubmission submission_;
+    inferbridge::native_harness::ResourceLifetimeDomainPtr lifetime_;
+    std::atomic<bool> cancelled_{false};
+};
+#endif
+
+class ExternalGpuImpl final : public ExternalGpu {
+public:
+    ExternalGpuImpl(const std::string& path, std::uint32_t index)
+        : weights_(path), config_(read_model_config(weights_)),
+          context_(index), model_(weights_, context_),
+          operators_(context_), moge_operators_(context_),
+          preprocessor_(context_)
+#if defined(_WIN32)
+          , d3d12_(matching_device(context_.adapter_luid()))
+#endif
+    {}
+
+    ExternalGpuCapabilities capabilities() const override {
+#if defined(_WIN32)
+        const auto& caps = context_.external_capabilities();
+        const bool available = d3d12_ && caps.timeline_semaphore &&
+            caps.d3d12_resource_import && caps.d3d12_fence_import &&
+            caps.d3d12_bgra8_sampled_image_import &&
+            caps.d3d12_r32_storage_image_import;
+        return {available, available ? context_.adapter_luid() : 0u,
+            available ? kMaximumJobs : 0u};
+#else
+        return {};
+#endif
+    }
+
+    std::shared_ptr<ExternalJob> submit_texture(
+        const ExternalTextureRequest& request) override {
+#if !defined(_WIN32)
+        (void)request;
+        throw std::runtime_error("MoGe-2 D3D12 interop requires Windows");
+#else
+        const auto caps = capabilities();
+        if (!caps.available) throw std::runtime_error(
+            "MoGe-2 D3D12/Vulkan interop is unavailable");
+        if (!request.input_texture || !request.output_texture ||
+            !request.wait_fence || !request.signal_fence || !request.width ||
+            !request.height || request.num_tokens < 16u ||
+            (request.rgba && !context_.external_capabilities().
+                d3d12_rgba8_sampled_image_import))
+            throw std::invalid_argument("invalid MoGe-2 external request");
+        const DXGI_FORMAT input_dxgi = request.rgba ?
+            DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+        const VkFormat input_vk = request.rgba ?
+            VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+        const float aspect = float(request.width) / float(request.height);
+        const std::uint32_t token_height = std::max(1u, static_cast<std::uint32_t>(
+            std::nearbyint(std::sqrt(float(request.num_tokens) / aspect))));
+        const std::uint32_t token_width = std::max(1u, static_cast<std::uint32_t>(
+            std::nearbyint(std::sqrt(float(request.num_tokens) * aspect))));
+        auto lifetime_guard = lifetime_->acquire();
+        const auto input_usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        const auto output_usage = VK_IMAGE_USAGE_STORAGE_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        auto& input = input_cache_.get_or_create({
+            inferbridge::native_harness::stable_resource_identity(
+                request.input_texture, request.input_texture_identity),
+            request.width, request.height, input_vk, input_usage}, [&] {
+                validate_texture(d3d12_.Get(), request.input_texture,
+                    request.width, request.height, input_dxgi);
+                return context_.import_d3d12_image(
+                    reinterpret_cast<void*>(request.input_texture),
+                    request.width, request.height, input_vk, input_usage);
+            });
+        const auto [depth_width,depth_height]=depth_shape(request.width,request.height,request.num_tokens);
+        auto& output = output_cache_.get_or_create({
+            inferbridge::native_harness::stable_resource_identity(
+                request.output_texture, request.output_texture_identity),
+            depth_width, depth_height, VK_FORMAT_R32_SFLOAT,
+            output_usage}, [&] {
+                validate_texture(d3d12_.Get(), request.output_texture,
+                    depth_width, depth_height, DXGI_FORMAT_R32_FLOAT);
+                return context_.import_d3d12_image(
+                    reinterpret_cast<void*>(request.output_texture),
+                    depth_width, depth_height, VK_FORMAT_R32_SFLOAT,
+                    output_usage);
+            });
+        auto wait = context_.import_d3d12_fence(
+            reinterpret_cast<void*>(request.wait_fence), request.wait_value);
+        auto signal = context_.import_d3d12_fence(
+            reinterpret_cast<void*>(request.signal_fence), request.signal_value);
+        auto submission = context_.segmented_batch_async(
+            std::move(wait), std::move(signal), [&] {
+                context_.acquire_external_image(input,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_SHADER_READ_BIT);
+                context_.acquire_external_image(output,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT);
+                const std::uint32_t encoder_width = token_width * 14u;
+                const std::uint32_t encoder_height = token_height * 14u;
+                auto image = context_.create_device_buffer(
+                    std::uint64_t(encoder_width) * encoder_height * 3u * sizeof(float));
+                preprocessor_.run_texture(image, input, encoder_width, encoder_height);
+                (void)infer_vits_normal(context_, model_, operators_,
+                    moge_operators_, config_, std::move(image),
+                    encoder_width, encoder_height,
+                    depth_width, depth_height,
+                    request.background_distance_metres, &output);
+                context_.release_external_image(input,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_SHADER_READ_BIT);
+                context_.release_external_image(output,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT);
+            });
+        return std::make_shared<Job>(shared_from_this(),
+            std::move(submission), lifetime_);
+#endif
+    }
+
+    void infer_host(const std::uint8_t* pixels, std::uint32_t width,
+        std::uint32_t height, std::size_t row_stride, bool rgba,
+        std::uint32_t num_tokens, float background_distance_metres,
+        float* output) override {
+#if defined(__linux__) && !defined(__ANDROID__)
+        std::lock_guard<std::mutex> lock(linux_execution_mutex_);
+#endif
+        if (pixels == nullptr || output == nullptr || width == 0u ||
+            height == 0u || num_tokens < 16u)
+            throw std::invalid_argument("invalid MoGe-2 host request");
+        const float aspect = static_cast<float>(width) / height;
+        const std::uint32_t token_height = std::max(1u,
+            static_cast<std::uint32_t>(std::nearbyint(
+                std::sqrt(static_cast<float>(num_tokens) / aspect))));
+        const std::uint32_t token_width = std::max(1u,
+            static_cast<std::uint32_t>(std::nearbyint(
+                std::sqrt(static_cast<float>(num_tokens) * aspect))));
+        const std::uint32_t encoder_width = token_width * 14u;
+        const std::uint32_t encoder_height = token_height * 14u;
+        constexpr inferbridge::native_harness::ImageNormalization normalization{
+            {0.485f, 0.456f, 0.406f}, {0.229f, 0.224f, 0.225f}};
+        auto normalized = inferbridge::native_harness::
+            resize_bgra8_to_normalized_chw(pixels, width, height, row_stride,
+                encoder_width, encoder_height, rgba, normalization);
+        auto image = context_.create_device_buffer(
+            normalized.size() * sizeof(float));
+        context_.upload(image, normalized.data(), normalized.size() * sizeof(float));
+        auto depth = infer_vits_normal(context_, model_, operators_,
+            moge_operators_, config_, std::move(image), encoder_width,
+            encoder_height, token_width*16u, token_height*16u, background_distance_metres);
+        context_.download(depth.depth, output,
+            static_cast<std::size_t>(token_width*16u) * (token_height*16u) * sizeof(float));
+    }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+    mutable std::mutex linux_execution_mutex_;
+    ibr_linux_capture_capabilities linux_capture_capabilities() const override {
+        return context_.linux_capture_capabilities();
+    }
+    void infer_linux_capture(const inferbridge::linux_capture::LinuxDmaBufImage& source,
+        uint32_t num_tokens,float background,float* output) override {
+        std::lock_guard<std::mutex> lock(linux_execution_mutex_);
+        const float aspect=float(source.width)/source.height;
+        const uint32_t width=std::max(1u,uint32_t(std::nearbyint(std::sqrt(num_tokens*aspect))))*14;
+        const uint32_t height=std::max(1u,uint32_t(std::nearbyint(std::sqrt(num_tokens/aspect))))*14;
+        auto image=inferbridge::linux_capture::capture_tensor(context_,source,width,height,
+            {1,false,{.485f,.456f,.406f,0},{.229f,.224f,.225f,1}});
+        auto depth=infer_vits_normal(context_,model_,operators_,moge_operators_,config_,
+            std::move(image),width,height,(width/14)*16,(height/14)*16,background);
+        context_.download(depth.depth,output,uint64_t(width/14*16)*(height/14*16)*sizeof(float));
+    }
+#endif
+    void transfer_counters(
+        std::uint64_t& upload_bytes, std::uint64_t& download_bytes) const override {
+        context_.transfer_counters(upload_bytes, download_bytes);
+    }
+private:
+    da3_native::SafeTensors weights_;
+    ModelConfig config_;
+    da3_native::VulkanContext context_;
+    da3_native::GpuModel model_;
+    da3_native::VulkanOperators operators_;
+    MoGeOperators moge_operators_;
+    GpuPreprocessor preprocessor_;
+#if defined(_WIN32)
+    ComPtr<ID3D12Device> d3d12_;
+    inferbridge::native_harness::StableResourceCache<da3_native::VulkanImage>
+        input_cache_;
+    inferbridge::native_harness::StableResourceCache<da3_native::VulkanImage>
+        output_cache_;
+    inferbridge::native_harness::ResourceLifetimeDomainPtr lifetime_ =
+        inferbridge::native_harness::make_resource_lifetime_domain();
+#endif
+};
+}  // namespace
+
+std::shared_ptr<ExternalGpu> create_external_gpu(
+    const std::string& path, std::uint32_t index) {
+    return std::make_shared<ExternalGpuImpl>(path, index);
+}
+
+ExternalGpuCapabilities probe_external_gpu(std::uint32_t index) {
+#if defined(_WIN32)
+    da3_native::VulkanContext context(index);
+    const auto& caps = context.external_capabilities();
+    const bool available = matching_device(context.adapter_luid()) &&
+        caps.timeline_semaphore && caps.d3d12_resource_import &&
+        caps.d3d12_fence_import && caps.d3d12_bgra8_sampled_image_import &&
+        caps.d3d12_r32_storage_image_import;
+    return {available, available ? context.adapter_luid() : 0u,
+        available ? kMaximumJobs : 0u};
+#else
+    (void)index;
+    return {};
+#endif
+}
+
+}  // namespace moge2_native
+
+extern "C" MOGE2_API int moge2_get_transfer_counters(
+    std::uint64_t* upload_bytes, std::uint64_t* download_bytes) {
+    if (!upload_bytes || !download_bytes) return 1;
+    da3_native::global_transfer_counters(*upload_bytes, *download_bytes);
+    return 0;
+}
